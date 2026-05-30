@@ -24,6 +24,16 @@ SYNC_SERVICE="/etc/systemd/system/realm-sync.service"
 SELF_PATH="/usr/local/bin/z-ui"        # 脚本自身安装位置
 LOCK_FILE="/run/realm-sync.lock"       # 防止同步重入
 
+# 脚本自身的下载地址(用于管道运行时安装 z-ui 快捷命令)
+# 注意: 如果你 fork 或改了仓库地址, 把下面这行改成你自己的 raw 地址
+SCRIPT_URL="https://raw.githubusercontent.com/wcdd/z-ui/main/setup.sh"
+SCRIPT_MIRRORS=(
+  "https://gh-proxy.com/"
+  "https://ghfast.top/"
+  "https://ghproxy.net/"
+  ""
+)
+
 # 来源标记: manual=手动添加  sync:<监控名>=自动同步而来
 DEFAULT_INTERVAL=60                     # 默认轮询间隔(秒)
 
@@ -38,12 +48,15 @@ pause() { echo ""; tread "按回车返回菜单..." _; }
 
 # 交互读取封装: 优先从真正的终端 /dev/tty 读取。
 # 这样即使脚本通过管道运行(如 bash <(curl ...) ),交互输入仍然有效。
-# 若环境无 /dev/tty(极少数场景), 则回退到标准输入。
+# 探测方式: 尝试以读方式打开 /dev/tty, 成功则用它, 否则回退到标准输入。
 tread() {
   local prompt="$1"; shift
-  if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
-    read -r -p "$prompt" "$@" </dev/tty
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    # /dev/tty 可用: 从 fd 3(真实终端)读取
+    read -r -p "$prompt" "$@" <&3
+    exec 3<&-
   else
+    # 无控制终端(极少数场景): 回退到标准输入
     read -r -p "$prompt" "$@"
   fi
 }
@@ -714,7 +727,7 @@ sync_menu() {
     echo -e "${P}        3x-ui 节点同步监控${N}"
     echo -e "${P}============================================${N}"
     local mcnt dstate
-    mcnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null || echo 0)
+    mcnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null | tr -d '\n'); : "${mcnt:=0}"
     if systemctl is-active --quiet realm-sync 2>/dev/null; then
       dstate="${G}● 运行中${N}"; else dstate="${R}● 已停止${N}"; fi
     echo -e "  监控目标: ${B}${mcnt}${N} 个     守护进程: ${dstate}"
@@ -808,10 +821,32 @@ uninstall_all() {
 #  注册 z-ui 快捷命令
 # =============================================================
 register_shortcut() {
-  local src; src="$(readlink -f "$0")"
-  if [ "$src" != "$SELF_PATH" ]; then
-    cp -f "$src" "$SELF_PATH"
-    chmod +x "$SELF_PATH"
+  # 已经是安装到位的 z-ui 本体, 无需处理
+  local src; src="$(readlink -f "$0" 2>/dev/null)"
+  if [ -n "$src" ] && [ "$src" = "$SELF_PATH" ]; then
+    return 0
+  fi
+
+  # 情况1: 通过本地真实文件运行 -> 直接复制
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    cp -f "$src" "$SELF_PATH" && chmod +x "$SELF_PATH" && return 0
+  fi
+
+  # 情况2: 通过管道运行(bash <(curl ...) 或 curl | bash),
+  #        $0 是管道描述符无法复制 -> 重新从网络下载自身
+  echo -e "${B}>>> 正在安装 z-ui 快捷命令...${N}"
+  local got=0 prefix
+  for prefix in "${SCRIPT_MIRRORS[@]}"; do
+    if curl -fsSL --max-time 30 "${prefix}${SCRIPT_URL}" -o "$SELF_PATH" 2>/dev/null \
+       && head -1 "$SELF_PATH" | grep -q '^#!'; then
+      chmod +x "$SELF_PATH"; got=1; break
+    fi
+  done
+  if [ "$got" = "1" ]; then
+    echo -e "${G}>>> z-ui 命令已安装, 以后可直接输入 z-ui 唤出面板${N}"
+  else
+    echo -e "${Y}>>> 自动安装 z-ui 命令失败(网络问题), 但不影响本次使用。${N}"
+    echo -e "${Y}    可稍后手动执行: curl -fsSL ${SCRIPT_URL} -o ${SELF_PATH} && chmod +x ${SELF_PATH}${N}"
   fi
 }
 
@@ -831,8 +866,8 @@ show_status() {
   else
     sync_state="${Y}● 未运行${N}"
   fi
-  rule_cnt=$(grep -c '^[0-9]' "$RULES" 2>/dev/null || echo 0)
-  mon_cnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null || echo 0)
+  rule_cnt=$(grep -c '^[0-9]' "$RULES" 2>/dev/null | tr -d '\n'); : "${rule_cnt:=0}"
+  mon_cnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null | tr -d '\n'); : "${mon_cnt:=0}"
 
   echo -e "${P}============================================${N}"
   echo -e "${P}        realm 转发管理面板  (z-ui)${N}"
