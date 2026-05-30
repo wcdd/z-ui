@@ -34,7 +34,19 @@ need_root() {
   [ "$(id -u)" != "0" ] && { echo -e "${R}请用 root 运行(sudo -i)${N}"; exit 1; }
 }
 
-pause() { echo ""; read -p "按回车返回菜单..." _; }
+pause() { echo ""; tread "按回车返回菜单..." _; }
+
+# 交互读取封装: 优先从真正的终端 /dev/tty 读取。
+# 这样即使脚本通过管道运行(如 bash <(curl ...) ),交互输入仍然有效。
+# 若环境无 /dev/tty(极少数场景), 则回退到标准输入。
+tread() {
+  local prompt="$1"; shift
+  if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
+    read -r -p "$prompt" "$@" </dev/tty
+  else
+    read -r -p "$prompt" "$@"
+  fi
+}
 
 # 确保数据文件存在
 ensure_files() {
@@ -185,7 +197,7 @@ remember_ip() {
 pick_ip() {
   PICKED_IP=""
   if [ ! -s "$IPS" ]; then
-    read -p "目标IP(落地机/B的入口IP): " PICKED_IP
+    tread "目标IP(落地机/B的入口IP): " PICKED_IP
     [ -n "$PICKED_IP" ] && remember_ip "$PICKED_IP" ""
     return
   fi
@@ -201,11 +213,11 @@ pick_ip() {
   done < "$IPS"
   echo -e "  ${Y}0${N}   彻底新增一个 IP"
   echo ""
-  read -p "选择已有IP序号, 或输入0新增: " sel
+  tread "选择已有IP序号, 或输入0新增: " sel
 
   if [ "$sel" = "0" ] || [ -z "$sel" ]; then
-    read -p "新目标IP: " PICKED_IP
-    read -p "该IP备注(可选,如: 日本落地机): " newnote
+    tread "新目标IP: " PICKED_IP
+    tread "该IP备注(可选,如: 日本落地机): " newnote
     [ -n "$PICKED_IP" ] && remember_ip "$PICKED_IP" "$newnote"
   elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#IP_ARR[@]}" ]; then
     PICKED_IP="${IP_ARR[$((sel-1))]}"
@@ -223,14 +235,14 @@ add_rule() {
   [ -x "$REALM_BIN" ] || { echo -e "${R}请先安装 realm(菜单1)${N}"; return 1; }
 
   echo -e "${B}=== 新增转发规则 ===${N}"
-  read -p "本机监听端口(用户访问的端口): " lport
+  tread "本机监听端口(用户访问的端口): " lport
 
   # 选择/新增目标 IP
   pick_ip
   local rip="$PICKED_IP"
 
-  read -p "目标端口(B上节点的端口): " rport
-  read -p "备注(可选,直接回车跳过,如: TK直播-日本): " note
+  tread "目标端口(B上节点的端口): " rport
+  tread "备注(可选,直接回车跳过,如: TK直播-日本): " note
 
   if [ -z "$lport" ] || [ -z "$rip" ] || [ -z "$rport" ]; then
     echo -e "${R}端口和目标IP不能为空${N}"; return 1
@@ -281,7 +293,7 @@ del_rule() {
   list_rules
   [ ! -s "$RULES" ] && return
   echo ""
-  read -p "输入要删除的序号(0取消): " idx
+  tread "输入要删除的序号(0取消): " idx
   [ "$idx" = "0" ] && return
   if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo -e "${R}请输入数字${N}"; return; fi
 
@@ -532,10 +544,10 @@ add_monitor() {
 
   echo -e "${B}=== 新增 3x-ui 监控目标 ===${N}"
   echo -e "${Y}提示: 需要 3x-ui 3.2.0+ 并已在面板生成 API token${N}"
-  read -p "监控名称(自定义, 如 jp-node): " name
-  read -p "面板地址(含端口与路径, 如 https://1.2.3.4:2053/abcd): " base
-  read -p "API Token: " token
-  read -p "转发落地IP(realm 把流量转去的IP, 通常就是该面板服务器IP): " rip
+  tread "监控名称(自定义, 如 jp-node): " name
+  tread "面板地址(含端口与路径, 如 https://1.2.3.4:2053/abcd): " base
+  tread "API Token: " token
+  tread "转发落地IP(realm 把流量转去的IP, 通常就是该面板服务器IP): " rip
 
   if [ -z "$name" ] || [ -z "$base" ] || [ -z "$token" ] || [ -z "$rip" ]; then
     echo -e "${R}所有字段均不能为空${N}"; return 1
@@ -550,7 +562,7 @@ add_monitor() {
   ports=$(fetch_inbound_ports "$base" "$token" 2>/tmp/sync_err)
   if [ $? -ne 0 ]; then
     echo -e "${R}连接/鉴权失败: $(cat /tmp/sync_err)${N}"
-    read -p "仍要保存该目标吗? (y/N): " c
+    tread "仍要保存该目标吗? (y/N): " c
     [ "$c" != "y" ] && [ "$c" != "Y" ] && { echo "已取消"; return 1; }
   else
     local cnt; cnt=$(echo "$ports" | grep -c '^[0-9]')
@@ -593,7 +605,7 @@ del_monitor() {
   list_monitors
   [ ! -s "$MONITORS" ] && return
   echo ""
-  read -p "输入要删除的监控序号(0取消): " idx
+  tread "输入要删除的监控序号(0取消): " idx
   [ "$idx" = "0" ] && return
   [[ "$idx" =~ ^[0-9]+$ ]] || { echo -e "${R}请输入数字${N}"; return; }
 
@@ -603,7 +615,7 @@ del_monitor() {
   local line; line=$(sed -n "${idx}p" "$MONITORS")
   local name; name=$(echo "$line" | cut -d'|' -f1)
 
-  read -p "是否同时删除该监控自动同步出来的所有转发规则? (y/N): " c
+  tread "是否同时删除该监控自动同步出来的所有转发规则? (y/N): " c
   sed -i "${idx}d" "$MONITORS"
 
   if [ "$c" = "y" ] || [ "$c" = "Y" ]; then
@@ -650,7 +662,7 @@ view_sync_log() {
   fi
   echo ""
   echo -e "${P}1${N}.实时跟踪日志(Ctrl+C退出)  ${P}2${N}.清空日志  ${P}回车${N}.返回"
-  read -p "选择: " c
+  tread "选择: " c
   case "$c" in
     1) echo -e "${B}(Ctrl+C 退出)${N}"; tail -f "$SYNC_LOG" ;;
     2) : > "$SYNC_LOG"; echo -e "${G}已清空${N}"; sleep 1 ;;
@@ -677,9 +689,9 @@ sync_settings() {
   echo -e "  ${G}3${N}. 停止守护进程"
   echo -e "  ${G}4${N}. 重启守护进程"
   echo -e "  ${G}0${N}. 返回"
-  read -p "选择: " c
+  tread "选择: " c
   case "$c" in
-    1) read -p "新的轮询间隔(秒, 建议>=30): " ni
+    1) tread "新的轮询间隔(秒, 建议>=30): " ni
        if [[ "$ni" =~ ^[0-9]+$ ]] && [ "$ni" -ge 5 ]; then
          echo "INTERVAL=${ni}" > "$SYNC_CONF"
          echo -e "${G}已设为 ${ni}s(守护进程下一轮生效)${N}"
@@ -715,7 +727,7 @@ sync_menu() {
     echo -e "  ${G}6${N}. 同步设置(间隔/守护)"
     echo -e "  ${G}0${N}. 返回主菜单"
     echo -e "${P}============================================${N}"
-    read -p "请输入数字并回车: " opt
+    tread "请输入数字并回车: " opt
     case "$opt" in
       1) add_monitor; pause ;;
       2) list_monitors; pause ;;
@@ -750,11 +762,11 @@ manage_ips() {
     fi
     echo ""
     echo -e "  ${G}1${N}. 新增IP  ${G}2${N}. 删除IP  ${G}0${N}. 返回"
-    read -p "选择: " c
+    tread "选择: " c
     case "$c" in
-      1) read -p "新IP: " ip; read -p "备注(可选): " nt
+      1) tread "新IP: " ip; tread "备注(可选): " nt
          [ -n "$ip" ] && remember_ip "$ip" "$nt" && echo -e "${G}已添加${N}"; sleep 1 ;;
-      2) read -p "删除序号(0取消): " idx
+      2) tread "删除序号(0取消): " idx
          [ "$idx" = "0" ] && continue
          [[ "$idx" =~ ^[0-9]+$ ]] && sed -i "${idx}d" "$IPS" && echo -e "${G}已删除${N}"; sleep 1 ;;
       0) return ;;
@@ -776,7 +788,7 @@ svc_log()     { echo -e "${B}(Ctrl+C 退出日志)${N}"; journalctl -u realm -f;
 # =============================================================
 uninstall_all() {
   echo -e "${R}=== 卸载 realm ===${N}"
-  read -p "确认卸载?将删除所有转发规则与监控配置 (y/N): " c
+  tread "确认卸载?将删除所有转发规则与监控配置 (y/N): " c
   [ "$c" != "y" ] && [ "$c" != "Y" ] && { echo "已取消"; return; }
   systemctl stop realm 2>/dev/null
   systemctl disable realm 2>/dev/null
@@ -785,7 +797,7 @@ uninstall_all() {
   rm -f "$SERVICE" "$SYNC_SERVICE"; systemctl daemon-reload
   rm -rf "$REALM_DIR" "$REALM_BIN"
   echo -e "${Y}realm 及全部规则/监控已卸载${N}"
-  read -p "是否同时移除 z-ui 快捷命令? (y/N): " c2
+  tread "是否同时移除 z-ui 快捷命令? (y/N): " c2
   if [ "$c2" = "y" ] || [ "$c2" = "Y" ]; then
     rm -f "$SELF_PATH"
     echo -e "${Y}z-ui 命令已移除${N}"
@@ -854,7 +866,7 @@ menu() {
     echo -e "  ${R}11${N}. 卸载 realm"
     echo -e "  ${G}0${N}. 退出面板"
     echo -e "${P}============================================${N}"
-    read -p "请输入数字并回车: " opt
+    tread "请输入数字并回车: " opt
     case "$opt" in
       1) install_realm; pause ;;
       2) add_rule; pause ;;
