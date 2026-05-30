@@ -25,23 +25,21 @@
 
 ### 方式一：一键安装（推荐）
 
-> 把下面的 `你的用户名/仓库名` 换成你自己的 GitHub 仓库地址。
-
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/仓库名/main/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/wcdd/z-ui/main/setup.sh)
 ```
 
 如果国内网络访问 GitHub 较慢，可用加速镜像：
 
 ```bash
-bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/你的用户名/仓库名/main/setup.sh)
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/wcdd/z-ui/main/setup.sh)
 ```
 
 ### 方式二：手动下载运行
 
 ```bash
 # 下载脚本
-wget -O setup.sh https://raw.githubusercontent.com/你的用户名/仓库名/main/setup.sh
+wget -O setup.sh https://raw.githubusercontent.com/wcdd/z-ui/main/setup.sh
 # 赋予执行权限
 chmod +x setup.sh
 # 运行（需 root）
