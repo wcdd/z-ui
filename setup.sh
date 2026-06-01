@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================
-#  z-ui  -  realm 端口转发管理面板  (增强版 v2)
+#  z-ui  -  realm 端口转发管理面板  (增强版 v3 · 自愈版)
 #  功能:
 #    - 安装/卸载 realm、增删查转发规则(带备注)、服务管理
 #    - 目标 IP 记忆复用: 新增转发时可选已存在 IP 或彻底新增
@@ -8,6 +8,12 @@
 #      目标新增节点 -> 本地同端口自动新增; 目标删除 -> 本地删除
 #    - 后台守护进程 24h 轮询, 崩溃/退出自动恢复(systemd)
 #    - 同步日志: 新增失败(端口占用等)记录, 面板可查看
+#  v3 改动(修复 realm 崩溃循环):
+#    - realm 要求顶层必须有 endpoints, 否则 panic(missing field `endpoints`)。
+#      旧版在"无规则"时生成的 config.toml 只有 [network], 会让 realm 无限崩溃重启。
+#    - 现在: 无规则 -> 写合法的空配置并停掉 realm(不开机自启, 不再空转/崩溃);
+#            有规则 -> 重建并校验配置后启动。配置一律原子写入。
+#    - realm.service 增加启动限速兜底; 新增"诊断并修复"菜单; 面板启动时自动自愈。
 #  快捷命令: 安装后输入  z-ui  即可随时唤出本面板
 # =============================================================
 
@@ -81,11 +87,89 @@ logsync() {
 }
 
 # =============================================================
+#  ★ v3 核心辅助函数(配置/服务自愈相关)
+# =============================================================
+
+# 统计合法转发规则条数(规则行以数字端口开头)。永远输出一个整数。
+count_rules() {
+  local c
+  c=$(grep -c '^[0-9]' "$RULES" 2>/dev/null)
+  echo "${c:-0}"
+}
+
+# 写入"合法的空配置"(无规则时使用)。
+# 关键: realm 要求顶层有 endpoints 字段; 空数组 endpoints=[] 必须写在 [network] 之前,
+#       否则会被当作 network.endpoints, 顶层仍然缺失从而 panic。
+write_empty_conf() {
+  cat > "${CONF}.tmp" << 'EOF'
+# z-ui: 当前没有转发规则, realm 已停止。新增规则后本文件会被自动重写并启动 realm。
+# (本文件由 z-ui 自动生成, 请勿手动编辑)
+endpoints = []
+
+[network]
+no_tcp = false
+use_udp = true
+EOF
+  mv -f "${CONF}.tmp" "$CONF"
+}
+
+# 结构化校验 config.toml 是否会被 realm 接受。
+# 只需确认顶层存在 endpoints: 要么有至少一个 [[endpoints]] 块, 要么是合法空数组。
+validate_conf() {
+  [ -f "$CONF" ] || return 1
+  grep -qE '^\[\[endpoints\]\]' "$CONF" && return 0
+  grep -qE '^[[:space:]]*endpoints[[:space:]]*=[[:space:]]*\[' "$CONF" && return 0
+  return 1
+}
+
+# 写 realm 主服务单元(安装与修复共用)。
+# 相比旧版增加了启动限速兜底: 万一将来再遇到崩溃, 不会无限刷屏, 而是进入 failed 态等待修复。
+write_realm_unit() {
+  cat > "$SERVICE" << EOF
+[Unit]
+Description=realm port forwarding
+After=network.target
+# 兜底: 5 分钟内若重启超过 10 次, 进入 failed 状态而不是无限重启刷屏。
+# (现代 systemd 要求这两项写在 [Unit] 段才生效)
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=${REALM_BIN} -c ${CONF}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 依据规则数量设置 realm 服务的正确状态:
+#   有规则 -> enable + (重)启动 ;  无规则 -> 停止 + disable(避免无规则时空转/崩溃)
+apply_realm_state() {
+  systemctl reset-failed realm >/dev/null 2>&1
+  if [ "$(count_rules)" -gt 0 ]; then
+    systemctl enable realm >/dev/null 2>&1
+    systemctl restart realm 2>/dev/null
+  else
+    systemctl disable realm >/dev/null 2>&1
+    systemctl stop realm 2>/dev/null
+  fi
+}
+
+# =============================================================
 #  安装 realm
 # =============================================================
 install_realm() {
   if [ -x "$REALM_BIN" ]; then
-    echo -e "${Y}realm 已安装,版本: $($REALM_BIN --version 2>/dev/null)${N}"
+    echo -e "${Y}realm 已安装,版本: $($REALM_BIN --version 2>/dev/null | head -1)${N}"
+    echo -e "${B}>>> 检查并升级 systemd 单元与配置(应用最新的自愈逻辑)...${N}"
+    write_realm_unit
+    install_sync_service
+    systemctl daemon-reload
+    rebuild_conf            # 重建配置并按当前规则数设为正确状态
+    echo -e "${G}>>> 已更新到最新单元配置${N}"
     return 0
   fi
 
@@ -133,41 +217,39 @@ install_realm() {
   install -m 755 /tmp/realm "$REALM_BIN"
   ensure_files
 
-  # 初始化空配置
-  [ -f "$CONF" ] || cat > "$CONF" << 'EOF'
-[network]
-no_tcp = false
-use_udp = true
-EOF
-
-  # 写 realm 主服务
-  cat > "$SERVICE" << EOF
-[Unit]
-Description=realm port forwarding
-After=network.target
-
-[Service]
-ExecStart=${REALM_BIN} -c ${CONF}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+  # 写 realm 主服务单元(已含启动限速兜底)
+  write_realm_unit
   systemctl daemon-reload
-  systemctl enable realm >/dev/null 2>&1
-  systemctl restart realm
-  echo -e "${G}>>> realm 安装完成${N}"
+
+  # 依据当前规则生成配置并设置正确状态:
+  #   首次安装通常无规则 -> 写合法空配置 + 停止 realm(不会再崩溃刷屏)
+  #   重装/更新且已有规则 -> 重建配置并启动
+  rebuild_conf
+
+  if [ "$(count_rules)" -gt 0 ]; then
+    echo -e "${G}>>> realm 安装完成, 已按现有规则启动${N}"
+  else
+    echo -e "${G}>>> realm 安装完成${N}"
+    echo -e "${Y}    当前还没有转发规则, realm 暂不运行;在菜单选 2 新增规则后会自动启动。${N}"
+  fi
 
   # 同时安装同步守护服务(默认不启动,等用户添加监控目标后再开)
   install_sync_service
 }
 
 # =============================================================
-#  根据 rules.db 重建 config.toml 并重启
+#  根据 rules.db 重建 config.toml 并设置服务状态
 # =============================================================
 rebuild_conf() {
+  local n; n="$(count_rules)"
+
+  # 无规则: 写合法空配置 + 停掉 realm, 杜绝 "missing field endpoints" 崩溃循环
+  if [ "$n" -le 0 ]; then
+    write_empty_conf
+    apply_realm_state
+    return 0
+  fi
+
   {
     echo "[network]"
     echo "no_tcp = false"
@@ -175,6 +257,10 @@ rebuild_conf() {
     echo ""
     while IFS='|' read -r lport rip rport note src; do
       [ -z "$lport" ] && continue
+      # 自我防御: 跳过非法行(端口非数字 / 目标IP为空), 避免生成会让 realm 崩溃的配置
+      [[ "$lport" =~ ^[0-9]+$ ]] || continue
+      [[ "$rport" =~ ^[0-9]+$ ]] || continue
+      [ -z "$rip" ] && continue
       echo "[[endpoints]]"
       local tag="$note"
       [ -n "$src" ] && [ "$src" != "manual" ] && tag="${note:+$note }[$src]"
@@ -183,8 +269,19 @@ rebuild_conf() {
       echo "remote = \"${rip}:${rport}\""
       echo ""
     done < "$RULES"
-  } > "$CONF"
-  systemctl restart realm 2>/dev/null
+  } > "${CONF}.tmp"
+
+  # 校验生成结果再原子落盘; 万一一条合法行都没生成出来(全被过滤),
+  # 退回合法空配置而不是让 realm 读到非法配置崩溃。
+  if grep -qE '^\[\[endpoints\]\]' "${CONF}.tmp"; then
+    mv -f "${CONF}.tmp" "$CONF"
+    apply_realm_state
+  else
+    rm -f "${CONF}.tmp"
+    logsync "rebuild_conf: 规则全部非法, 未生成有效 endpoint, 已退回空配置"
+    write_empty_conf
+    apply_realm_state
+  fi
 }
 
 # =============================================================
@@ -276,6 +373,11 @@ add_rule() {
   fi
 
   echo -e "${G}>>> 添加成功!  本机:${lport}  ->  ${rip}:${rport}  ${note:+[$note]}${N}"
+  if systemctl is-active --quiet realm 2>/dev/null; then
+    echo -e "${G}>>> realm 已应用新规则并运行中${N}"
+  else
+    echo -e "${Y}>>> 注意: realm 未处于运行态, 可执行菜单 11 诊断并修复${N}"
+  fi
 }
 
 # =============================================================
@@ -321,6 +423,9 @@ del_rule() {
   rebuild_conf
   command -v ufw >/dev/null && ufw delete allow "${dport}" >/dev/null 2>&1
   echo -e "${G}>>> 已删除序号 ${idx} (端口 ${dport})${N}"
+  if [ "$(count_rules)" -le 0 ]; then
+    echo -e "${Y}>>> 已无转发规则, realm 已自动停止(这是正常的)${N}"
+  fi
 }
 
 # =============================================================
@@ -483,7 +588,7 @@ sync_one_target() {
 
   if [ "$changed" -eq 1 ]; then
     rebuild_conf
-    logsync "[${name}] 配置已更新并重启 realm"
+    logsync "[${name}] 配置已更新并应用(当前规则 $(count_rules) 条)"
   fi
   return 0
 }
@@ -532,15 +637,16 @@ install_sync_service() {
 [Unit]
 Description=realm 3x-ui sync daemon
 After=network.target realm.service
+# 防止反复崩溃时疯狂重启(现代 systemd 要求这两项写在 [Unit] 段才生效):
+# 10 分钟内最多重启 100 次, 超过则进入失败态
+StartLimitIntervalSec=600
+StartLimitBurst=100
 
 [Service]
 Type=simple
 ExecStart=${SELF_PATH} --daemon
 Restart=always
 RestartSec=5
-# 防止反复崩溃时疯狂重启: 10分钟内最多重启 100 次, 超过则进入失败态
-StartLimitIntervalSec=600
-StartLimitBurst=100
 
 [Install]
 WantedBy=multi-user.target
@@ -791,10 +897,116 @@ manage_ips() {
 # =============================================================
 #  服务控制
 # =============================================================
-svc_restart() { systemctl restart realm && echo -e "${G}已重启${N}"; }
+# 重启/启动时若没有规则, 不去启动空配置(避免无意义的启动失败), 并清除失败计数。
+svc_restart() {
+  if [ "$(count_rules)" -le 0 ]; then
+    echo -e "${Y}当前无转发规则, realm 无需运行(保持停止)。新增规则后会自动启动。${N}"
+    return
+  fi
+  systemctl reset-failed realm >/dev/null 2>&1
+  systemctl restart realm && echo -e "${G}已重启${N}"
+}
 svc_stop()    { systemctl stop realm && echo -e "${Y}已停止${N}"; }
-svc_start()   { systemctl start realm && echo -e "${G}已启动${N}"; }
+svc_start()   {
+  if [ "$(count_rules)" -le 0 ]; then
+    echo -e "${Y}当前无转发规则, 无需启动。请先在菜单选 2 新增规则。${N}"
+    return
+  fi
+  systemctl reset-failed realm >/dev/null 2>&1
+  systemctl start realm && echo -e "${G}已启动${N}"
+}
 svc_log()     { echo -e "${B}(Ctrl+C 退出日志)${N}"; journalctl -u realm -f; }
+
+# =============================================================
+#  ★ 诊断并修复 realm (菜单 11 / 启动时自动调用)
+# =============================================================
+repair_realm() {
+  echo -e "${B}=== 诊断并修复 realm ===${N}"
+  ensure_files
+
+  # 1) 二进制是否安装
+  if [ ! -x "$REALM_BIN" ]; then
+    echo -e "${R}realm 未安装。请先在主菜单选 1 安装。${N}"
+    return 1
+  fi
+  echo -e "  realm 程序: ${G}已安装${N} ($($REALM_BIN --version 2>/dev/null | head -1))"
+
+  # 2) 清洗 rules.db: 只保留 "数字端口|非空IP|数字端口" 的合法行; 顺手按本机端口去重(保留首条)
+  if [ -s "$RULES" ]; then
+    awk -F'|' '
+      $1 ~ /^[0-9]+$/ && $2 != "" && $3 ~ /^[0-9]+$/ {
+        if (!seen[$1]++) print $0
+      }
+    ' "$RULES" > "${RULES}.tmp" && mv "${RULES}.tmp" "$RULES"
+  fi
+  local n; n="$(count_rules)"
+  echo -e "  转发规则: ${B}${n}${N} 条"
+
+  # 3) 重建并校验 config.toml(原子写; 无规则则写合法空配置)
+  rebuild_conf
+  if validate_conf; then
+    echo -e "  配置文件: ${G}有效${N} (${CONF})"
+  else
+    echo -e "  配置文件: ${R}异常, 已重置为安全配置${N}"
+    write_empty_conf
+  fi
+
+  # 4) 重写并升级 systemd 单元(让老安装也用上启动限速兜底), 清除失败计数
+  write_realm_unit
+  install_sync_service
+  systemctl daemon-reload
+  systemctl reset-failed realm >/dev/null 2>&1
+
+  # 5) 设置正确的服务状态
+  apply_realm_state
+
+  # 6) 汇报结果
+  sleep 1
+  echo ""
+  if [ "$n" -le 0 ]; then
+    echo -e "${G}>>> 修复完成。${N}当前无规则, realm 保持停止(这是正常的); 新增规则后会自动启动。"
+  elif systemctl is-active --quiet realm; then
+    echo -e "${G}>>> 修复完成, realm 正在运行。${N}"
+  else
+    echo -e "${Y}>>> 已重建配置但 realm 仍未运行, 最近日志:${N}"
+    journalctl -u realm -n 15 --no-pager 2>/dev/null
+    echo -e "${Y}    常见原因: 某个本机端口被其它进程占用。可用菜单 3 查看规则, 4 删除冲突端口后重试。${N}"
+  fi
+}
+
+# 启动面板时静默自愈: 仅在"确有异常"时出手, 不打扰正常状态,
+# 也不擅自启动被用户手动停掉的服务(只修复崩溃/非法配置这类真故障)。
+auto_heal() {
+  [ -x "$REALM_BIN" ] || return 0
+  local need=0
+  # a) 服务处于 failed 状态(典型: 之前因缺 endpoints 崩溃循环到达上限)
+  systemctl is-failed --quiet realm 2>/dev/null && need=1
+  # b) 配置缺失, 或顶层缺少 endpoints(就是会触发 panic 的那种)
+  [ -f "$CONF" ] || need=1
+  validate_conf || need=1
+
+  [ "$need" -eq 0 ] && return 0
+
+  echo -e "${Y}>>> 检测到 realm 配置/服务异常, 正在自动修复...${N}"
+  # 清洗规则
+  if [ -s "$RULES" ]; then
+    awk -F'|' '$1 ~ /^[0-9]+$/ && $2 != "" && $3 ~ /^[0-9]+$/ { if(!seen[$1]++) print $0 }' \
+      "$RULES" > "${RULES}.tmp" && mv "${RULES}.tmp" "$RULES"
+  fi
+  write_realm_unit
+  systemctl daemon-reload
+  systemctl reset-failed realm >/dev/null 2>&1
+  rebuild_conf
+
+  if [ "$(count_rules)" -le 0 ]; then
+    echo -e "${G}>>> 自动修复完成。${N}(当前无转发规则, realm 保持停止)"
+  elif systemctl is-active --quiet realm; then
+    echo -e "${G}>>> 自动修复完成, realm 已恢复运行。${N}"
+  else
+    echo -e "${Y}>>> 已重建配置, 但 realm 仍未起来(可能端口被占用)。可进面板选 11 查看详情。${N}"
+  fi
+  sleep 1
+}
 
 # =============================================================
 #  卸载
@@ -856,8 +1068,15 @@ register_shortcut() {
 show_status() {
   local inst_state svc_state sync_state rule_cnt mon_cnt
   if [ -x "$REALM_BIN" ]; then inst_state="${G}已安装${N}"; else inst_state="${R}未安装${N}"; fi
+  rule_cnt=$(count_rules)
+  mon_cnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null | tr -d '\n'); : "${mon_cnt:=0}"
+
   if systemctl is-active --quiet realm 2>/dev/null; then
     svc_state="${G}● 运行中${N}"
+  elif systemctl is-failed --quiet realm 2>/dev/null; then
+    svc_state="${R}● 异常(选 11 修复)${N}"
+  elif [ "$rule_cnt" -le 0 ]; then
+    svc_state="${Y}● 已停止(无规则)${N}"
   else
     svc_state="${R}● 已停止${N}"
   fi
@@ -866,8 +1085,6 @@ show_status() {
   else
     sync_state="${Y}● 未运行${N}"
   fi
-  rule_cnt=$(grep -c '^[0-9]' "$RULES" 2>/dev/null | tr -d '\n'); : "${rule_cnt:=0}"
-  mon_cnt=$(grep -c '^[^|]' "$MONITORS" 2>/dev/null | tr -d '\n'); : "${mon_cnt:=0}"
 
   echo -e "${P}============================================${N}"
   echo -e "${P}        realm 转发管理面板  (z-ui)${N}"
@@ -898,7 +1115,8 @@ menu() {
     echo -e "  ${G}9${N}. 启动 realm 服务"
     echo -e "  ${G}10${N}. 查看 realm 实时日志"
     echo -e "  ${P}--------------------------------------------${N}"
-    echo -e "  ${R}11${N}. 卸载 realm"
+    echo -e "  ${B}11${N}. ${B}诊断并修复 realm${N} ★"
+    echo -e "  ${R}12${N}. 卸载 realm"
     echo -e "  ${G}0${N}. 退出面板"
     echo -e "${P}============================================${N}"
     tread "请输入数字并回车: " opt
@@ -913,7 +1131,8 @@ menu() {
       8) svc_stop; pause ;;
       9) svc_start; pause ;;
       10) svc_log ;;
-      11) uninstall_all; pause ;;
+      11) repair_realm; pause ;;
+      12) uninstall_all; pause ;;
       0) echo "已退出。下次输入 z-ui 再次进入。"; exit 0 ;;
       *) echo -e "${R}无效选项${N}"; sleep 1 ;;
     esac
@@ -932,6 +1151,13 @@ fi
 # 供外部/定时器单次触发
 if [ "$1" = "--sync-once" ]; then
   sync_all
+  exit 0
+fi
+# 非交互修复(可用于定时巡检 / 出问题时一条命令拉起): z-ui --repair
+if [ "$1" = "--repair" ]; then
+  need_root
+  ensure_files
+  repair_realm
   exit 0
 fi
 
@@ -955,5 +1181,8 @@ if [ -s "$RULES" ] && ! grep -q '|manual$\|sync:' "$RULES" 2>/dev/null; then
     print $1"|"$2"|"$3"|"$4"|"src
   }' "$RULES" > "${RULES}.tmp" && mv "${RULES}.tmp" "$RULES"
 fi
+
+# 启动自愈: 若检测到之前的崩溃/异常配置(如缺 endpoints), 自动修复后再进菜单
+auto_heal
 
 menu
